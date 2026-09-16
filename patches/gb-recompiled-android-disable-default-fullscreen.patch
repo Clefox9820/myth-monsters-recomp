@@ -1,0 +1,30 @@
+diff --git a/runtime/src/platform_sdl.cpp b/runtime/src/platform_sdl.cpp
+index 9e4eeb7..f7219c3 100644
+--- a/runtime/src/platform_sdl.cpp
++++ b/runtime/src/platform_sdl.cpp
+@@ -310,11 +310,21 @@ static bool env_flag_enabled(const char* name) {
+ }
+ 
+ static bool platform_default_fullscreen(void) {
+-#if defined(__ANDROID__)
+-    return true;
+-#else
++    /*
++     * SDL's Android backend re-hides the system UI 2000ms after the first
++     * onSystemUiVisibilityChange callback whenever fullscreen mode is
++     * active (SDLActivity.rehideSystemUi, scheduled from
++     * onSystemUiVisibilityChange). That re-hide triggers a decor view
++     * layout pass and thus a SurfaceHolder callback on the UI thread while
++     * the native SDL_Main thread may be mid-frame against the same
++     * ANativeWindow/renderer, a known unsynchronized race in SDL2's
++     * Android backend (libsdl-org/SDL#2875) that can crash a
++     * SDL_TEXTUREACCESS_STREAMING renderer on a window resize. Default to
++     * a non-fullscreen window on Android (system bars stay visible) to
++     * avoid scheduling that timer at all; players who want edge-to-edge
++     * display can still opt back in from the settings menu.
++     */
+     return false;
+-#endif
+ }
+ 
+ static bool platform_uses_app_storage_for_relative_paths(void) {
