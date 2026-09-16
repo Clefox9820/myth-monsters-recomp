@@ -1,0 +1,28 @@
+diff --git a/recompiler/src/main.cpp b/recompiler/src/main.cpp
+index 69cee7d..469fddc 100644
+--- a/recompiler/src/main.cpp
++++ b/recompiler/src/main.cpp
+@@ -734,7 +734,8 @@ static std::string make_android_app_build_gradle(const std::string& android_pack
+     ss << "}\n\n";
+     ss << "android {\n";
+     ss << "    namespace \"" << android_package << "\"\n";
+-    ss << "    compileSdk 34\n\n";
++    ss << "    compileSdk 34\n";
++    ss << "    ndkVersion \"27.0.12077973\"\n\n";
+     ss << "    defaultConfig {\n";
+     ss << "        applicationId \"" << android_package << "\"\n";
+     ss << "        minSdk 24\n";
+@@ -850,6 +851,13 @@ if(NOT EXISTS "${SDL2_SOURCE_DIR}/CMakeLists.txt")
+     message(FATAL_ERROR "SDL2_SOURCE_DIR='${SDL2_SOURCE_DIR}' does not point to an SDL2 source tree.")
+ endif()
+ 
++# Android 15+ devices may run with a 16 KB kernel page size. A shared library
++# whose ELF LOAD segments are only 4 KB-aligned fails to dlopen there
++# ("unsupported page size"), which surfaces as an immediate crash on launch.
++# Force 16 KB-aligned segments for every shared library this build produces,
++# including SDL2's own libSDL2.so.
++set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384")
++
+ add_subdirectory("${SDL2_SOURCE_DIR}" SDL EXCLUDE_FROM_ALL)
+ add_subdirectory(src)
+ )CMAKE";
