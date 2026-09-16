@@ -74,6 +74,32 @@ ninja -C output/kid-icarus/build
 
 `scripts/build.sh` wraps steps 3–5.
 
+## Running without a native desktop (Wine / GameNative / Proton)
+
+If you don't have a PC to build/run on natively, cross-compile a Windows x64
+build from Linux with MinGW-w64 and run it through a Windows compatibility
+layer instead — this is exactly the approach [GameNative](https://github.com/GameNative/GameNative)
+(a Winlator fork) uses to run Windows x86/x64 games on Android:
+
+```bash
+./scripts/build-windows.sh
+```
+
+This produces `dist/win64/kidicarus.exe` plus the DLLs it needs (`SDL2.dll`,
+`libstdc++-6.dll`, `libgcc_s_seh-1.dll`). Copy that whole folder to wherever
+you'll run it:
+
+- **GameNative on Android**: import the folder as a game, same as any other
+  Windows x86/x64 title.
+- **Wine/Proton on Linux**: `wine kidicarus.exe`.
+- **A real Windows PC**: just double-click it.
+
+Verified in this sandbox: the cross-compiled `.exe` was launched under Wine
+in a virtual framebuffer and correctly rendered the game's title screen
+(SDL2 window/renderer init, no missing-DLL or API errors). Real-device
+touch/controller input mapping through GameNative has not been verified —
+report back if button mapping needs adjusting for a touchscreen/gamepad.
+
 ## Status
 
 - Recompiler builds cleanly and generates a C project from the ROM (some
