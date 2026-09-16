@@ -33,7 +33,17 @@ if [ -z "${ANDROID_HOME:-}${ANDROID_SDK_ROOT:-}" ]; then
   exit 1
 fi
 
-# 1. Build the recompiler.
+# 1. Apply local fixes to the gb-recompiled submodule, then build the
+#    recompiler. Upstream's --android generator omits gbrt_data_mod.c,
+#    gbrt_hash.c, gbrt_host_configuration.c, gbrt_port.c,
+#    gbrt_presentation.c and gbrt_semantic.c from the JNI CMakeLists it
+#    writes (present in the desktop CMakeLists it also emits), which fails
+#    the native link with undefined gbrt_data_mod_*/gbrt_port_* symbols.
+PATCH="$ROOT/patches/gb-recompiled-android-jni-missing-runtime-sources.patch"
+if [ -f "$PATCH" ] && ! git -C "$ROOT/tools/gb-recompiled" apply --reverse --check "$PATCH" >/dev/null 2>&1; then
+  git -C "$ROOT/tools/gb-recompiled" apply "$PATCH"
+fi
+
 cmake -G Ninja -B "$ROOT/tools/gb-recompiled/build" "$ROOT/tools/gb-recompiled"
 ninja -C "$ROOT/tools/gb-recompiled/build"
 
