@@ -1,0 +1,9 @@
+# ROMs are copyrighted — never commit them. Place your own legally-owned
+# dump here locally; this whole directory is ignored.
+/roms/
+
+# Build outputs
+/build/
+/tools/gb-recompiled-build/
+/output/
+/dist/
