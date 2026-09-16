@@ -97,6 +97,33 @@ API errors). Real-device touch/controller input mapping through GameNative
 has not been verified — report back if button mapping needs adjusting for a
 touchscreen/gamepad.
 
+## Native Android build (portrait, for clip-on controllers)
+
+`gb-recompiled --android` generates a real ARM64 Android project, but its
+manifest hardcodes `android:screenOrientation="landscape"` with no CLI flag
+to change it. `patches/android-portrait-orientation.patch` flips that one
+line to `portrait`, for use with clip-on portrait controllers (e.g. the
+GameSir Pocket Taco, which clips to the bottom of the phone in portrait and
+expects the screen upright, not sideways).
+
+```bash
+export ANDROID_HOME=/path/to/android-sdk
+export ANDROID_NDK_HOME=/path/to/android-ndk
+export SDL2_SOURCE_DIR=/path/to/SDL-source-checkout   # needs android-project/
+./scripts/build-android.sh
+```
+
+This produces `output/game/android/app/build/outputs/apk/debug/app-debug.apk`.
+No touch controls are added — it's controller/keyboard input only, matching
+upstream's "controller-first" Android scope.
+
+**Known limitation**: building this requires downloading the Android SDK/NDK
+from `dl.google.com`, which some network policies block outright (including
+the sandbox this project was originally scaffolded in — see
+`tools/gb-recompiled/ANDROID.md` for the full requirement list). If
+`build-android.sh` can't reach `dl.google.com`, run it from a machine/environment
+without that restriction.
+
 ## Status
 
 - Recompiler builds cleanly and generates a C project from a ROM (some

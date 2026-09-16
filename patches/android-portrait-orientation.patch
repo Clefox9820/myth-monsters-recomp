@@ -1,0 +1,13 @@
+diff --git a/recompiler/src/main.cpp b/recompiler/src/main.cpp
+index 69cee7d..6d913db 100644
+--- a/recompiler/src/main.cpp
++++ b/recompiler/src/main.cpp
+@@ -801,7 +801,7 @@ static std::string make_android_manifest(const std::string& android_package) {
+     ss << "            android:label=\"@string/app_name\"\n";
+     ss << "            android:launchMode=\"singleTask\"\n";
+     ss << "            android:preferMinimalPostProcessing=\"true\"\n";
+-    ss << "            android:screenOrientation=\"landscape\">\n";
++    ss << "            android:screenOrientation=\"portrait\">\n";
+     ss << "            <intent-filter>\n";
+     ss << "                <action android:name=\"android.intent.action.MAIN\" />\n";
+     ss << "                <category android:name=\"android.intent.category.LAUNCHER\" />\n";
