@@ -74,6 +74,42 @@ ninja -C output/kid-icarus/build
 
 `scripts/build.sh` wraps steps 3–5.
 
+## Android (native APK, portrait / GameSir Pocket)
+
+`gb-recompiled` can also emit a real Android Studio/Gradle project (native
+`arm64-v8a`, controller-first, no touch overlay) — see
+`tools/gb-recompiled/ANDROID.md` for the full picture. By default it locks
+the activity to landscape, which doesn't work with a portrait clip-on pad
+like the **GameSir Pocket**. `scripts/build-android.sh` wraps the generator
+and patches the generated manifest to `android:screenOrientation="portrait"`
+so the game runs vertically, matching how the controller clips onto the
+phone.
+
+### Requirements
+
+- Android SDK + NDK (`ANDROID_HOME` or `ANDROID_SDK_ROOT` set)
+- Gradle on `PATH`
+- an SDL2 source checkout (`SDL2_SOURCE_DIR=/path/to/SDL`)
+- `adb`, and your own legally-dumped ROM in `roms/`
+
+### Build and install
+
+```bash
+export SDL2_SOURCE_DIR=/path/to/SDL
+export ANDROID_HOME=/path/to/android-sdk   # must include an NDK
+
+./scripts/build-android.sh
+# -> output/kid-icarus/android/app/build/outputs/apk/debug/app-debug.apk
+
+adb install -r output/kid-icarus/android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+The default controller mapping (D-pad/stick to move, face buttons to A/B,
+Start/Select, Guide/Home for settings) works out of the box with the
+GameSir Pocket over Bluetooth/USB — see `tools/gb-recompiled/ANDROID.md`
+for the full button layout and how to remap it from the in-game settings
+menu.
+
 ## Running without a native desktop (Wine / GameNative / Proton)
 
 If you don't have a PC to build/run on natively, cross-compile a Windows x64
