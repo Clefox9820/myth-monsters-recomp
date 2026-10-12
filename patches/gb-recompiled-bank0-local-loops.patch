@@ -1,0 +1,20 @@
+diff --git a/recompiler/src/codegen/c_emitter.cpp b/recompiler/src/codegen/c_emitter.cpp
+index 1a499d8..4040daf 100644
+--- a/recompiler/src/codegen/c_emitter.cpp
++++ b/recompiler/src/codegen/c_emitter.cpp
+@@ -998,7 +998,14 @@ static const ir::BasicBlock* find_safe_local_target_block(const ir::Program& pro
+                                                           const EmittedBody* current_body,
+                                                           BankId bank,
+                                                           uint16_t addr) {
+-    if (current_body == nullptr || current_body->bank != bank || current_body->may_switch_rom_bank) {
++    if (current_body == nullptr || current_body->bank != bank) {
++        return nullptr;
++    }
++
++    // A ROM bank switch only remaps 0x4000-0x7FFF. Targets in the fixed bank-0
++    // region stay valid, so keep them as local gotos; emitting them as calls
++    // turns tight loops (e.g. memcpy back-edges) into unbounded native recursion.
++    if (current_body->may_switch_rom_bank && addr >= 0x4000) {
+         return nullptr;
+     }
+ 

@@ -1,0 +1,14 @@
+diff --git a/recompiler/src/main.cpp b/recompiler/src/main.cpp
+index 69cee7d..ed1d230 100644
+--- a/recompiler/src/main.cpp
++++ b/recompiler/src/main.cpp
+@@ -942,6 +942,9 @@ static std::string make_android_jni_src_cmake(const fs::path& output_dir,
+     ss << ")\n";
+     ss << "if(CMAKE_BUILD_TYPE STREQUAL \"Debug\")\n";
+     ss << "    target_compile_options(gbrt PRIVATE -O0 -g)\n";
++    ss << "    # Generated code relies on sibling-call optimization for cross-function\n";
++    ss << "    # jumps (func_X(ctx); return;); at -O0 those grow the native stack.\n";
++    ss << "    set_source_files_properties(${GBRECOMP_GENERATED_SOURCES} PROPERTIES COMPILE_OPTIONS \"-O2;-g\")\n";
+     ss << "else()\n";
+     ss << "    target_compile_options(gbrt PRIVATE -O3)\n";
+     ss << "    set_source_files_properties(${GBRECOMP_GENERATED_SOURCES} PROPERTIES COMPILE_OPTIONS \"-O3\")\n";
