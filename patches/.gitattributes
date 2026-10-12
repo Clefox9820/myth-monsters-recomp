@@ -1,0 +1,2 @@
+# Patches are applied to the gb-recompiled submodule with git apply; keep LF.
+*.patch text eol=lf
