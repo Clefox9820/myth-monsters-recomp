@@ -1,0 +1,1719 @@
+diff --git a/runtime/include/gbrt.h b/runtime/include/gbrt.h
+index 4c588b9..d1adce8 100644
+--- a/runtime/include/gbrt.h
++++ b/runtime/include/gbrt.h
+@@ -59,6 +59,9 @@ extern bool gbrt_trace_enabled;
+ extern bool gbrt_log_lcd_transitions;
+ extern bool gbrt_dispatch_fallback_tracking_enabled;
+ extern bool gbrt_rgb_framebuffer_enabled;
++/* Render every OAM sprite on a scanline (no 10-sprite flicker). Render-only:
++ * mode-3 timing still uses the hardware-accurate 10-sprite selection. */
++extern bool gbrt_unlimited_sprites;
+ extern bool gbrt_benchmark_fast_tick_enabled;
+ extern bool gbrt_force_scalar_timer;
+ extern bool gbrt_force_eager_audio;
+@@ -693,6 +696,32 @@ bool gb_context_save_state_file(GBContext* ctx, const char* path);
+  */
+ bool gb_context_load_state_file(GBContext* ctx, const char* path);
+ 
++/**
++ * @brief Size in bytes of a full snapshot of @p ctx (same format as the
++ *        savestate file), or 0 when the context is not ready.
++ */
++size_t gb_context_state_size(const GBContext* ctx);
++
++/**
++ * @brief Serialize a full snapshot into a caller-provided buffer
++ * @param ctx Source context
++ * @param buffer Destination, at least gb_context_state_size(ctx) bytes
++ * @param capacity Size of @p buffer
++ * @param out_size Optional; receives the number of bytes written
++ * @return true on success
++ */
++bool gb_context_save_state_buffer(GBContext* ctx,
++                                  void* buffer,
++                                  size_t capacity,
++                                  size_t* out_size);
++
++/**
++ * @brief Restore a snapshot produced by gb_context_save_state_buffer() or
++ *        read from a savestate file
++ * @return true on success; the header is validated before any state changes
++ */
++bool gb_context_load_state_buffer(GBContext* ctx, const void* buffer, size_t size);
++
+ /* ============================================================================
+  * Memory Access
+  * ========================================================================== */
+diff --git a/runtime/include/ppu.h b/runtime/include/ppu.h
+index 82eac9b..ad6d994 100644
+--- a/runtime/include/ppu.h
++++ b/runtime/include/ppu.h
+@@ -227,6 +227,19 @@ void ppu_clear_frame_ready(GBPPU* ppu);
+  */
+ const uint32_t* ppu_get_framebuffer(GBPPU* ppu);
+ 
++/** Source layer of an emitted pixel, for host-side colorization. */
++#define PPU_LAYER_BG   0u /* Background */
++#define PPU_LAYER_OBJ0 1u /* Sprite using OBP0 */
++#define PPU_LAYER_OBJ1 2u /* Sprite using OBP1 */
++#define PPU_LAYER_WIN  3u /* Window (typically the HUD) */
++
++/**
++ * @brief Per-pixel source layer (PPU_LAYER_*) of the most recently emitted
++ *        pixels, GB_SCREEN_WIDTH * GB_SCREEN_HEIGHT bytes. Not part of GBPPU
++ *        or savestates; only meaningful for the DMG dot renderer.
++ */
++const uint8_t* ppu_get_layer_buffer(void);
++
+ /** @brief Return the RGB color emitted for a DMG shade (0-3). */
+ uint32_t ppu_get_dmg_shade_rgb(uint8_t shade);
+ 
+diff --git a/runtime/src/gbrt.c b/runtime/src/gbrt.c
+index cb01b84..2e5967e 100644
+--- a/runtime/src/gbrt.c
++++ b/runtime/src/gbrt.c
+@@ -32,6 +32,7 @@ bool gbrt_trace_enabled = false;
+ bool gbrt_log_lcd_transitions = false;
+ bool gbrt_dispatch_fallback_tracking_enabled = false;
+ bool gbrt_rgb_framebuffer_enabled = true;
++bool gbrt_unlimited_sprites = true;
+ bool gbrt_benchmark_fast_tick_enabled = false;
+ bool gbrt_force_scalar_timer = false;
+ bool gbrt_force_eager_audio = false;
+@@ -55,7 +56,6 @@ static bool gb_context_try_load_battery_ram(GBContext* ctx);
+ static bool gb_context_try_load_rtc(GBContext* ctx);
+ static uint64_t gb_context_compute_rom_hash(const GBContext* ctx);
+ static bool gbrt_write_exact(FILE* file, const void* data, size_t size);
+-static bool gbrt_read_exact(FILE* file, void* data, size_t size);
+ 
+ typedef struct {
+     uint64_t saved_unix_time;
+@@ -895,10 +895,6 @@ static bool gbrt_write_exact(FILE* file, const void* data, size_t size) {
+     return size == 0 || (file && data && fwrite(data, 1, size, file) == size);
+ }
+ 
+-static bool gbrt_read_exact(FILE* file, void* data, size_t size) {
+-    return size == 0 || (file && data && fread(data, 1, size, file) == size);
+-}
+-
+ static void gbrt_capture_core_state(const GBContext* ctx, GBSavestateCoreState* state) {
+     if (!ctx || !state) {
+         return;
+@@ -1612,30 +1608,42 @@ bool gb_context_write_state_json(const GBContext* ctx, const char* path) {
+     return success;
+ }
+ 
+-bool gb_context_save_state_file(GBContext* ctx, const char* path) {
+-    if (!ctx || !path || !path[0] || !ctx->rom || ctx->rom_size == 0 ||
+-        !ctx->wram || !ctx->vram || !ctx->oam || !ctx->hram || !ctx->io) {
+-        return false;
+-    }
+-
+-    gbrt_audio_sync(ctx);
++static bool gbrt_state_context_ready(const GBContext* ctx) {
++    return ctx && ctx->rom && ctx->rom_size > 0 &&
++           ctx->wram && ctx->vram && ctx->oam && ctx->hram && ctx->io;
++}
+ 
+-    FILE* file = fopen(path, "wb");
+-    if (!file) {
+-        fprintf(stderr, "[GBRT] Failed to open savestate for writing: %s\n", path);
+-        return false;
+-    }
++static void gbrt_state_fill_header(const GBContext* ctx,
++                                   GBSavestateFileHeader* header) {
++    memset(header, 0, sizeof(*header));
++    header->magic = GBSAVESTATE_MAGIC;
++    header->version = GBSAVESTATE_VERSION;
++    header->rom_hash = gb_context_compute_rom_hash(ctx);
++    header->rom_size = (uint32_t)ctx->rom_size;
++    header->eram_size = (uint32_t)ctx->eram_size;
++    header->wram_size = WRAM_BANK_SIZE * 8u;
++    header->vram_size = VRAM_SIZE * 2u;
++    header->oam_size = OAM_SIZE;
++    header->hram_size = HRAM_SIZE;
++    header->io_size = IO_SIZE + 1u;
++    header->ppu_size = ctx->ppu ? (uint32_t)sizeof(GBPPU) : 0u;
++    header->apu_size = ctx->apu ? (uint32_t)gb_audio_state_size() : 0u;
++}
+ 
+-    const size_t apu_state_size = ctx->apu ? gb_audio_state_size() : 0;
+-    void* apu_state = NULL;
+-    bool success = true;
++static size_t gbrt_state_payload_size(const GBSavestateFileHeader* header) {
++    return sizeof(GBSavestateFileHeader) + sizeof(GBSavestateCoreState) +
++           (size_t)header->eram_size + (size_t)header->wram_size +
++           (size_t)header->vram_size + (size_t)header->oam_size +
++           (size_t)header->hram_size + (size_t)header->io_size +
++           (size_t)header->ppu_size + (size_t)header->apu_size;
++}
+ 
++size_t gb_context_state_size(const GBContext* ctx) {
++    if (!gbrt_state_context_ready(ctx)) {
++        return 0;
++    }
+     GBSavestateFileHeader header;
+     memset(&header, 0, sizeof(header));
+-    header.magic = GBSAVESTATE_MAGIC;
+-    header.version = GBSAVESTATE_VERSION;
+-    header.rom_hash = gb_context_compute_rom_hash(ctx);
+-    header.rom_size = (uint32_t)ctx->rom_size;
+     header.eram_size = (uint32_t)ctx->eram_size;
+     header.wram_size = WRAM_BANK_SIZE * 8u;
+     header.vram_size = VRAM_SIZE * 2u;
+@@ -1643,206 +1651,226 @@ bool gb_context_save_state_file(GBContext* ctx, const char* path) {
+     header.hram_size = HRAM_SIZE;
+     header.io_size = IO_SIZE + 1u;
+     header.ppu_size = ctx->ppu ? (uint32_t)sizeof(GBPPU) : 0u;
+-    header.apu_size = (uint32_t)apu_state_size;
++    header.apu_size = ctx->apu ? (uint32_t)gb_audio_state_size() : 0u;
++    return gbrt_state_payload_size(&header);
++}
+ 
+-    GBSavestateCoreState core_state;
+-    gbrt_capture_core_state(ctx, &core_state);
++static void gbrt_state_put(uint8_t** cursor, const void* data, size_t size) {
++    if (size > 0) {
++        memcpy(*cursor, data, size);
++        *cursor += size;
++    }
++}
+ 
+-    if (apu_state_size > 0) {
+-        apu_state = malloc(apu_state_size);
+-        if (!apu_state || !gb_audio_save_state(ctx->apu, apu_state, apu_state_size)) {
+-            fprintf(stderr, "[GBRT] Failed to serialize APU state for savestate: %s\n", path);
+-            success = false;
+-        }
++bool gb_context_save_state_buffer(GBContext* ctx,
++                                  void* buffer,
++                                  size_t capacity,
++                                  size_t* out_size) {
++    if (out_size) {
++        *out_size = 0;
++    }
++    if (!gbrt_state_context_ready(ctx) || !buffer) {
++        return false;
+     }
+ 
+-    if (success) success = gbrt_write_exact(file, &header, sizeof(header));
+-    if (success) success = gbrt_write_exact(file, &core_state, sizeof(core_state));
+-    if (success) success = gbrt_write_exact(file, ctx->eram, ctx->eram_size);
+-    if (success) success = gbrt_write_exact(file, ctx->wram, WRAM_BANK_SIZE * 8u);
+-    if (success) success = gbrt_write_exact(file, ctx->vram, VRAM_SIZE * 2u);
+-    if (success) success = gbrt_write_exact(file, ctx->oam, OAM_SIZE);
+-    if (success) success = gbrt_write_exact(file, ctx->hram, HRAM_SIZE);
+-    if (success) success = gbrt_write_exact(file, ctx->io, IO_SIZE + 1u);
+-    if (success && header.ppu_size > 0) success = gbrt_write_exact(file, ctx->ppu, sizeof(GBPPU));
+-    if (success && apu_state_size > 0) success = gbrt_write_exact(file, apu_state, apu_state_size);
++    GBSavestateFileHeader header;
++    gbrt_state_fill_header(ctx, &header);
++    const size_t total = gbrt_state_payload_size(&header);
++    if (capacity < total) {
++        return false;
++    }
+ 
+-    if (!success) {
+-        fprintf(stderr, "[GBRT] Failed to write savestate: %s\n", path);
++    gbrt_audio_sync(ctx);
++
++    GBSavestateCoreState core_state;
++    gbrt_capture_core_state(ctx, &core_state);
++
++    uint8_t* cursor = (uint8_t*)buffer;
++    gbrt_state_put(&cursor, &header, sizeof(header));
++    gbrt_state_put(&cursor, &core_state, sizeof(core_state));
++    gbrt_state_put(&cursor, ctx->eram, ctx->eram_size);
++    gbrt_state_put(&cursor, ctx->wram, WRAM_BANK_SIZE * 8u);
++    gbrt_state_put(&cursor, ctx->vram, VRAM_SIZE * 2u);
++    gbrt_state_put(&cursor, ctx->oam, OAM_SIZE);
++    gbrt_state_put(&cursor, ctx->hram, HRAM_SIZE);
++    gbrt_state_put(&cursor, ctx->io, IO_SIZE + 1u);
++    if (header.ppu_size > 0) {
++        gbrt_state_put(&cursor, ctx->ppu, sizeof(GBPPU));
++    }
++    if (header.apu_size > 0 &&
++        !gb_audio_save_state(ctx->apu, cursor, header.apu_size)) {
++        return false;
+     }
++    cursor += header.apu_size;
+ 
+-    fclose(file);
+-    if (!success) {
+-        remove(path);
+-    } else {
+-        printf("[GBRT] Saved state to %s\n", path);
++    if (out_size) {
++        *out_size = (size_t)(cursor - (uint8_t*)buffer);
+     }
+-    free(apu_state);
+-    return success;
++    return true;
+ }
+ 
+-bool gb_context_load_state_file(GBContext* ctx, const char* path) {
+-    if (!ctx || !path || !path[0] || !ctx->rom || ctx->rom_size == 0 ||
+-        !ctx->wram || !ctx->vram || !ctx->oam || !ctx->hram || !ctx->io) {
++static bool gbrt_load_state_from_buffer(GBContext* ctx,
++                                        const void* buffer,
++                                        size_t size,
++                                        const char* label) {
++    if (!gbrt_state_context_ready(ctx) || !buffer) {
+         return false;
+     }
+-
+-    FILE* file = fopen(path, "rb");
+-    if (!file) {
+-        fprintf(stderr, "[GBRT] Failed to open savestate for reading: %s\n", path);
++    if (size < sizeof(GBSavestateFileHeader) + sizeof(GBSavestateCoreState)) {
++        fprintf(stderr, "[GBRT] Failed to read savestate header: %s\n", label);
+         return false;
+     }
+ 
+-    bool success = true;
+     GBSavestateFileHeader header;
+-    memset(&header, 0, sizeof(header));
++    memcpy(&header, buffer, sizeof(header));
+ 
+-    GBSavestateCoreState core_state;
+-    memset(&core_state, 0, sizeof(core_state));
+-
+-    void* eram_data = NULL;
+-    void* wram_data = NULL;
+-    void* vram_data = NULL;
+-    void* oam_data = NULL;
+-    void* hram_data = NULL;
+-    void* io_data = NULL;
+-    void* ppu_data = NULL;
+-    void* apu_data = NULL;
+-
+-    if (!gbrt_read_exact(file, &header, sizeof(header))) {
+-        fprintf(stderr, "[GBRT] Failed to read savestate header: %s\n", path);
+-        success = false;
+-    }
+-
+-    const uint64_t expected_rom_hash = gb_context_compute_rom_hash(ctx);
+     const size_t expected_apu_size = ctx->apu ? gb_audio_state_size() : 0;
+-    if (success && header.magic != GBSAVESTATE_MAGIC) {
+-        fprintf(stderr, "[GBRT] Savestate has invalid magic: %s\n", path);
+-        success = false;
++    if (header.magic != GBSAVESTATE_MAGIC) {
++        fprintf(stderr, "[GBRT] Savestate has invalid magic: %s\n", label);
++        return false;
+     }
+-    if (success && header.version != GBSAVESTATE_VERSION) {
++    if (header.version != GBSAVESTATE_VERSION) {
+         fprintf(stderr, "[GBRT] Savestate version mismatch for %s (got %u, expected %u)\n",
+-                path,
++                label,
+                 header.version,
+                 GBSAVESTATE_VERSION);
+-        success = false;
++        return false;
+     }
+-    if (success &&
+-        (header.rom_size != ctx->rom_size || header.rom_hash != expected_rom_hash)) {
+-        fprintf(stderr, "[GBRT] Savestate ROM mismatch for %s\n", path);
+-        success = false;
++    if (header.rom_size != ctx->rom_size ||
++        header.rom_hash != gb_context_compute_rom_hash(ctx)) {
++        fprintf(stderr, "[GBRT] Savestate ROM mismatch for %s\n", label);
++        return false;
+     }
+-    if (success &&
+-        (header.eram_size != ctx->eram_size ||
+-         header.wram_size != WRAM_BANK_SIZE * 8u ||
+-         header.vram_size != VRAM_SIZE * 2u ||
+-         header.oam_size != OAM_SIZE ||
+-         header.hram_size != HRAM_SIZE ||
+-         header.io_size != IO_SIZE + 1u)) {
+-        fprintf(stderr, "[GBRT] Savestate memory layout mismatch for %s\n", path);
+-        success = false;
++    if (header.eram_size != ctx->eram_size ||
++        header.wram_size != WRAM_BANK_SIZE * 8u ||
++        header.vram_size != VRAM_SIZE * 2u ||
++        header.oam_size != OAM_SIZE ||
++        header.hram_size != HRAM_SIZE ||
++        header.io_size != IO_SIZE + 1u) {
++        fprintf(stderr, "[GBRT] Savestate memory layout mismatch for %s\n", label);
++        return false;
+     }
+-    if (success && header.ppu_size != (ctx->ppu ? (uint32_t)sizeof(GBPPU) : 0u)) {
+-        fprintf(stderr, "[GBRT] Savestate PPU layout mismatch for %s\n", path);
+-        success = false;
++    if (header.ppu_size != (ctx->ppu ? (uint32_t)sizeof(GBPPU) : 0u)) {
++        fprintf(stderr, "[GBRT] Savestate PPU layout mismatch for %s\n", label);
++        return false;
+     }
+-    if (success && header.apu_size != expected_apu_size) {
+-        fprintf(stderr, "[GBRT] Savestate APU layout mismatch for %s\n", path);
+-        success = false;
++    if (header.apu_size != expected_apu_size) {
++        fprintf(stderr, "[GBRT] Savestate APU layout mismatch for %s\n", label);
++        return false;
++    }
++    if (size < gbrt_state_payload_size(&header)) {
++        fprintf(stderr, "[GBRT] Failed to load savestate data: %s\n", label);
++        return false;
+     }
+ 
+-    if (success) success = gbrt_read_exact(file, &core_state, sizeof(core_state));
+-    if (!success) {
+-        fclose(file);
++    const uint8_t* cursor = (const uint8_t*)buffer + sizeof(header);
++    GBSavestateCoreState core_state;
++    memcpy(&core_state, cursor, sizeof(core_state));
++    cursor += sizeof(core_state);
++
++    if (ctx->eram_size > 0) memcpy(ctx->eram, cursor, ctx->eram_size);
++    cursor += ctx->eram_size;
++    memcpy(ctx->wram, cursor, WRAM_BANK_SIZE * 8u);
++    cursor += WRAM_BANK_SIZE * 8u;
++    memcpy(ctx->vram, cursor, VRAM_SIZE * 2u);
++    cursor += VRAM_SIZE * 2u;
++    memcpy(ctx->oam, cursor, OAM_SIZE);
++    cursor += OAM_SIZE;
++    memcpy(ctx->hram, cursor, HRAM_SIZE);
++    cursor += HRAM_SIZE;
++    memcpy(ctx->io, cursor, IO_SIZE + 1u);
++    cursor += IO_SIZE + 1u;
++    if (header.ppu_size > 0 && ctx->ppu) memcpy(ctx->ppu, cursor, header.ppu_size);
++    cursor += header.ppu_size;
++    if (header.apu_size > 0 && ctx->apu &&
++        !gb_audio_load_state(ctx->apu, cursor, header.apu_size)) {
++        fprintf(stderr, "[GBRT] Failed to restore APU state from savestate: %s\n", label);
+         return false;
+     }
++    gbrt_restore_core_state(ctx, &core_state);
++    ctx->audio_pending_cpu_cycles = 0u;
++    ctx->audio_cycles_until_event = 0u;
++    ctx->audio_pending_old_div = ctx->div_counter;
++    ctx->audio_pending_system_cycle_remainder =
++        ctx->cgb_system_cycle_remainder & 1u;
++    ctx->audio_pending_double_speed = ctx->cgb_double_speed ? 1u : 0u;
++    return true;
++}
+ 
+-    if (ctx->eram_size > 0) {
+-        eram_data = malloc(ctx->eram_size);
+-        success = eram_data != NULL && gbrt_read_exact(file, eram_data, ctx->eram_size);
++bool gb_context_load_state_buffer(GBContext* ctx, const void* buffer, size_t size) {
++    return gbrt_load_state_from_buffer(ctx, buffer, size, "<memory>");
++}
++
++bool gb_context_save_state_file(GBContext* ctx, const char* path) {
++    if (!gbrt_state_context_ready(ctx) || !path || !path[0]) {
++        return false;
+     }
+-    if (success) {
+-        wram_data = malloc(WRAM_BANK_SIZE * 8u);
+-        success = wram_data != NULL && gbrt_read_exact(file, wram_data, WRAM_BANK_SIZE * 8u);
++
++    const size_t capacity = gb_context_state_size(ctx);
++    void* buffer = capacity ? malloc(capacity) : NULL;
++    size_t size = 0;
++    if (!buffer || !gb_context_save_state_buffer(ctx, buffer, capacity, &size)) {
++        fprintf(stderr, "[GBRT] Failed to serialize savestate: %s\n", path);
++        free(buffer);
++        return false;
+     }
+-    if (success) {
+-        vram_data = malloc(VRAM_SIZE * 2u);
+-        success = vram_data != NULL && gbrt_read_exact(file, vram_data, VRAM_SIZE * 2u);
++
++    FILE* file = fopen(path, "wb");
++    if (!file) {
++        fprintf(stderr, "[GBRT] Failed to open savestate for writing: %s\n", path);
++        free(buffer);
++        return false;
+     }
+-    if (success) {
+-        oam_data = malloc(OAM_SIZE);
+-        success = oam_data != NULL && gbrt_read_exact(file, oam_data, OAM_SIZE);
++
++    bool success = gbrt_write_exact(file, buffer, size);
++    if (!success) {
++        fprintf(stderr, "[GBRT] Failed to write savestate: %s\n", path);
+     }
+-    if (success) {
+-        hram_data = malloc(HRAM_SIZE);
+-        success = hram_data != NULL && gbrt_read_exact(file, hram_data, HRAM_SIZE);
++
++    if (fclose(file) != 0) {
++        success = false;
+     }
+-    if (success) {
+-        io_data = malloc(IO_SIZE + 1u);
+-        success = io_data != NULL && gbrt_read_exact(file, io_data, IO_SIZE + 1u);
++    if (!success) {
++        remove(path);
++    } else {
++        printf("[GBRT] Saved state to %s\n", path);
+     }
+-    if (success && header.ppu_size > 0) {
+-        ppu_data = malloc(header.ppu_size);
+-        success = ppu_data != NULL && gbrt_read_exact(file, ppu_data, header.ppu_size);
++    free(buffer);
++    return success;
++}
++
++bool gb_context_load_state_file(GBContext* ctx, const char* path) {
++    if (!gbrt_state_context_ready(ctx) || !path || !path[0]) {
++        return false;
+     }
+-    if (success && header.apu_size > 0) {
+-        apu_data = malloc(header.apu_size);
+-        success = apu_data != NULL && gbrt_read_exact(file, apu_data, header.apu_size);
++
++    FILE* file = fopen(path, "rb");
++    if (!file) {
++        fprintf(stderr, "[GBRT] Failed to open savestate for reading: %s\n", path);
++        return false;
+     }
+ 
++    /* A valid state for this context is exactly gb_context_state_size()
++     * bytes; the header check rejects states with a different layout, and
++     * the payload-size check rejects truncated files. */
++    const size_t expected = gb_context_state_size(ctx);
++    uint8_t* buffer = (uint8_t*)malloc(expected + 1u);
++    size_t size = 0;
++    if (buffer) {
++        size = fread(buffer, 1, expected + 1u, file);
++    }
+     fclose(file);
+-
+-    if (!success) {
++    if (!buffer) {
+         fprintf(stderr, "[GBRT] Failed to load savestate data: %s\n", path);
+-        free(eram_data);
+-        free(wram_data);
+-        free(vram_data);
+-        free(oam_data);
+-        free(hram_data);
+-        free(io_data);
+-        free(ppu_data);
+-        free(apu_data);
+         return false;
+     }
+ 
+-    if (ctx->eram_size > 0) memcpy(ctx->eram, eram_data, ctx->eram_size);
+-    memcpy(ctx->wram, wram_data, WRAM_BANK_SIZE * 8u);
+-    memcpy(ctx->vram, vram_data, VRAM_SIZE * 2u);
+-    memcpy(ctx->oam, oam_data, OAM_SIZE);
+-    memcpy(ctx->hram, hram_data, HRAM_SIZE);
+-    memcpy(ctx->io, io_data, IO_SIZE + 1u);
+-    if (header.ppu_size > 0 && ctx->ppu) memcpy(ctx->ppu, ppu_data, header.ppu_size);
+-    if (header.apu_size > 0 && ctx->apu && !gb_audio_load_state(ctx->apu, apu_data, header.apu_size)) {
+-        fprintf(stderr, "[GBRT] Failed to restore APU state from savestate: %s\n", path);
+-        free(eram_data);
+-        free(wram_data);
+-        free(vram_data);
+-        free(oam_data);
+-        free(hram_data);
+-        free(io_data);
+-        free(ppu_data);
+-        free(apu_data);
+-        return false;
++    const bool success = gbrt_load_state_from_buffer(ctx, buffer, size, path);
++    free(buffer);
++    if (success) {
++        printf("[GBRT] Loaded state from %s\n", path);
+     }
+-    gbrt_restore_core_state(ctx, &core_state);
+-    ctx->audio_pending_cpu_cycles = 0u;
+-    ctx->audio_cycles_until_event = 0u;
+-    ctx->audio_pending_old_div = ctx->div_counter;
+-    ctx->audio_pending_system_cycle_remainder =
+-        ctx->cgb_system_cycle_remainder & 1u;
+-    ctx->audio_pending_double_speed = ctx->cgb_double_speed ? 1u : 0u;
+-
+-    free(eram_data);
+-    free(wram_data);
+-    free(vram_data);
+-    free(oam_data);
+-    free(hram_data);
+-    free(io_data);
+-    free(ppu_data);
+-    free(apu_data);
+-
+-    printf("[GBRT] Loaded state from %s\n", path);
+-    return true;
++    return success;
+ }
+ 
+ /* Cartridge RAM is addressed with however many bank/address lines the chip
+diff --git a/runtime/src/platform_sdl.cpp b/runtime/src/platform_sdl.cpp
+index f7219c3..433f16f 100644
+--- a/runtime/src/platform_sdl.cpp
++++ b/runtime/src/platform_sdl.cpp
+@@ -14,6 +14,7 @@
+ #include <SDL.h>
+ #include <atomic>
+ #include <cerrno>
++#include <cmath>
+ #include <cctype>
+ #include <cstdio>
+ #include <cstring>
+@@ -77,7 +78,14 @@ static bool g_fullscreen = false;
+ static bool g_app_suspended = false;
+ static bool g_renderer_reset_pending = false;
+ static GBPlatformExitAction g_exit_action = GB_PLATFORM_EXIT_QUIT;
+-static const char* g_palette_names[] = { "Original (Green)", "Black & White (Pocket)", "Amber (Plasma)" };
++static const char* g_palette_names[] = {
++    "Original (Green)",
++    "Black & White (Pocket)",
++    "Amber (Plasma)",
++    "Kid Icarus Sky",
++    "Pocket Gray",
++    "Colorized (BG / OBJ0 / OBJ1)",
++};
+ static const char* g_scale_names[] = { "1x (160x144)", "2x (320x288)", "3x (480x432)", "4x (640x576)", "5x (800x720)", "6x (960x864)", "7x (1120x1008)", "8x (1280x1152)" };
+ typedef enum GBRenderScalingMode {
+     GB_RENDER_SCALING_PIXEL_PERFECT = 0,
+@@ -114,7 +122,8 @@ typedef enum GBInputAction {
+     GB_INPUT_ACTION_TOGGLE_MUTE = 15,
+     GB_INPUT_ACTION_TOGGLE_MENU = 16,
+     GB_INPUT_ACTION_TOGGLE_PORT_UI = 17,
+-    GB_INPUT_ACTION_COUNT = 18,
++    GB_INPUT_ACTION_REWIND = 18,
++    GB_INPUT_ACTION_COUNT = 19,
+ } GBInputAction;
+ typedef enum GBInputBindingKind {
+     GB_INPUT_BINDING_NONE = 0,
+@@ -166,8 +175,40 @@ static const char* g_render_filter_names[] = {
+ static const uint32_t g_palettes[][4] = {
+     { 0xFFE0F8D0, 0xFF88C070, 0xFF346856, 0xFF081820 }, // Original
+     { 0xFFFFFFFF, 0xFFAAAAAA, 0xFF555555, 0xFF000000 }, // B&W
+-    { 0xFFFFB000, 0xFFCB4F0E, 0xFF800000, 0xFF330000 }  // Amber
++    { 0xFFFFB000, 0xFFCB4F0E, 0xFF800000, 0xFF330000 }, // Amber
++    { 0xFFF8F0D8, 0xFF8CC8E8, 0xFF3E6EA8, 0xFF1A1E40 }, // Kid Icarus Sky
++    { 0xFFC5CAA4, 0xFF8C926B, 0xFF4A5138, 0xFF181818 }, // Pocket Gray
++};
++/* "Colorized" is the palette entry right after g_palettes: each pixel is
++ * recolored by its PPU source layer (BG/window, OBJ0, OBJ1). */
++static constexpr int GB_PALETTE_COLORIZED =
++    (int)(sizeof(g_palettes) / sizeof(g_palettes[0]));
++static_assert(GB_PALETTE_COLORIZED + 1 ==
++                  (int)(sizeof(g_palette_names) / sizeof(g_palette_names[0])),
++              "palette names must list every palette plus Colorized");
++// Colorized mode: each layer uses a multi-hue ramp (lightest -> darkest shade)
++// instead of tints of a single hue. Indexed by PPU_LAYER_*.
++static const uint32_t g_colorized_palettes[4][4] = {
++    { 0xFFF8E8C8, 0xFFE0C898, 0xFF6878B8, 0xFF242040 }, // BG: sky, sand marble, periwinkle stone, indigo
++    { 0xFFFFFFFF, 0xFFB8A0F0, 0xFFD04838, 0xFF200828 }, // OBJ0: white, lavender, crimson, plum
++    { 0xFFFFFFFF, 0xFFF8C8A0, 0xFFD89038, 0xFF3A1810 }, // OBJ1 (Pit): white, skin, gold, brown
++    { 0xFFF8F0D0, 0xFFE8B048, 0xFFA04828, 0xFF281810 }, // WIN/HUD: cream, gold, brick, umber
+ };
++// The lightest background shade is drawn as a vertical sky gradient.
++static const uint32_t g_colorized_sky_top = 0xFF78C0F0;
++static const uint32_t g_colorized_sky_bottom = 0xFFF8E8C8;
++
++static uint32_t lerp_argb(uint32_t a, uint32_t b, int num, int den) {
++    uint32_t out = 0xFF000000u;
++    for (int shift = 0; shift <= 16; shift += 8) {
++        const int ca = (int)((a >> shift) & 0xFFu);
++        const int cb = (int)((b >> shift) & 0xFFu);
++        out |= (uint32_t)(ca + (cb - ca) * num / den) << shift;
++    }
++    return out;
++}
++static bool g_lcd_grid_enabled = false;
++static uint8_t g_last_guest_layer_buffer[GB_FRAMEBUFFER_SIZE];
+ static uint32_t g_lcd_off_framebuffer[GB_FRAMEBUFFER_SIZE];
+ static uint32_t g_last_guest_framebuffer[GB_FRAMEBUFFER_SIZE];
+ static bool g_lcd_off_framebuffer_initialized = false;
+@@ -208,6 +249,7 @@ static const char* g_input_action_names[GB_INPUT_ACTION_COUNT] = {
+     "Toggle Mute",
+     "Toggle Menu",
+     "Toggle Game Panel",
++    "Rewind (Hold)",
+ };
+ 
+ static bool has_interpreter_activity(const GBContext* ctx) {
+@@ -245,6 +287,33 @@ static bool input_action_is_runtime(GBInputAction action);
+ static int effective_speed_percent(void);
+ static void update_runtime_action_state(GBContext* ctx);
+ 
++/* Rewind: in-memory snapshots taken every few guest frames. Slots are
++ * allocated lazily (one full savestate each) and freed when disabled. */
++static constexpr int GB_REWIND_SNAPSHOT_INTERVAL = 4;
++static constexpr int GB_REWIND_CAPACITY = 150; /* ~10 s at 59.7 fps */
++static bool g_rewind_enabled = true;
++static std::atomic<bool> g_rewind_active{false};
++static uint8_t* g_rewind_slots[GB_REWIND_CAPACITY] = {};
++static size_t g_rewind_state_size = 0;
++static int g_rewind_head = 0;
++static int g_rewind_count = 0;
++static int g_rewind_frame_counter = 0;
++static bool g_touch_rewind_held = false;
++static bool g_touch_fast_forward_held = false;
++static uint8_t g_touch_joypad_dpad = 0xFF;    /* Active low, same bits as g_joypad_dpad */
++static uint8_t g_touch_joypad_buttons = 0xFF; /* Active low, same bits as g_joypad_buttons */
++typedef enum GBTouchControlsMode {
++    GB_TOUCH_CONTROLS_AUTO = 0,
++    GB_TOUCH_CONTROLS_ON = 1,
++    GB_TOUCH_CONTROLS_OFF = 2,
++} GBTouchControlsMode;
++static const char* g_touch_controls_mode_names[] = { "Auto", "On", "Off" };
++static const char* g_touch_controls_mode_config[] = { "auto", "on", "off" };
++static GBTouchControlsMode g_touch_controls_mode = GB_TOUCH_CONTROLS_AUTO;
++static void rewind_clear(bool free_memory);
++static size_t rewind_memory_bytes(void);
++static void rewind_on_guest_frame(GBContext* ctx);
++
+ /* Joypad state - exported for gbrt.c to access */
+ uint8_t g_joypad_buttons = 0xFF;  /* Active low: Start, Select, B, A */
+ uint8_t g_joypad_dpad = 0xFF;     /* Active low: Down, Up, Left, Right */
+@@ -849,6 +918,7 @@ static const char* input_action_config_name(GBInputAction action) {
+         case GB_INPUT_ACTION_TOGGLE_MUTE: return "toggle_mute";
+         case GB_INPUT_ACTION_TOGGLE_MENU: return "toggle_menu";
+         case GB_INPUT_ACTION_TOGGLE_PORT_UI: return "toggle_port_ui";
++        case GB_INPUT_ACTION_REWIND: return "rewind";
+         case GB_INPUT_ACTION_COUNT:
+         default:
+             return "unknown";
+@@ -940,8 +1010,8 @@ static void set_default_input_bindings(void) {
+     g_keyboard_bindings[GB_INPUT_ACTION_A][1] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_J);
+     g_keyboard_bindings[GB_INPUT_ACTION_B][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_X);
+     g_keyboard_bindings[GB_INPUT_ACTION_B][1] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_K);
+-    g_keyboard_bindings[GB_INPUT_ACTION_SELECT][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_BACKSPACE);
+-    g_keyboard_bindings[GB_INPUT_ACTION_SELECT][1] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_RSHIFT);
++    g_keyboard_bindings[GB_INPUT_ACTION_SELECT][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_RSHIFT);
++    g_keyboard_bindings[GB_INPUT_ACTION_REWIND][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_BACKSPACE);
+     g_keyboard_bindings[GB_INPUT_ACTION_START][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_RETURN);
+     g_keyboard_bindings[GB_INPUT_ACTION_FAST_FORWARD][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_TAB);
+     g_keyboard_bindings[GB_INPUT_ACTION_TOGGLE_MAX_SPEED][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_GRAVE);
+@@ -969,7 +1039,7 @@ static void set_default_input_bindings(void) {
+     g_controller_bindings[GB_INPUT_ACTION_SELECT][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_BACK);
+     g_controller_bindings[GB_INPUT_ACTION_START][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_START);
+     g_controller_bindings[GB_INPUT_ACTION_FAST_FORWARD][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_AXIS_POSITIVE, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+-    g_controller_bindings[GB_INPUT_ACTION_TOGGLE_MAX_SPEED][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_AXIS_POSITIVE, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
++    g_controller_bindings[GB_INPUT_ACTION_REWIND][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_AXIS_POSITIVE, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+     g_controller_bindings[GB_INPUT_ACTION_SAVE_STATE][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_X);
+     g_controller_bindings[GB_INPUT_ACTION_LOAD_STATE][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_Y);
+     g_controller_bindings[GB_INPUT_ACTION_TOGGLE_MENU][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_LEFTSTICK);
+@@ -994,7 +1064,15 @@ static void load_runtime_preferences(void) {
+     g_savestate_slot = 0;
+     g_savestate_status.clear();
+     g_max_speed_mode = false;
++    gbrt_unlimited_sprites = true;
++    g_palette_idx = 0;
++    g_render_filter_mode = GB_RENDER_FILTER_NEAREST;
++    g_render_scaling_mode = GB_RENDER_SCALING_PIXEL_PERFECT;
++    g_lcd_grid_enabled = false;
++    g_rewind_enabled = true;
++    g_touch_controls_mode = GB_TOUCH_CONTROLS_AUTO;
+     bool saw_controller_port_ui_binding = false;
++    bool saw_rewind_binding = false;
+ 
+     const std::string path = runtime_preferences_path();
+     if (!path.empty()) {
+@@ -1046,6 +1124,47 @@ static void load_runtime_preferences(void) {
+                     g_audio_target_device_name = value;
+                     continue;
+                 }
++                if (strcmp(key, "video.palette") == 0) {
++                    long parsed = strtol(value, NULL, 10);
++                    if (parsed >= 0 && parsed < IM_ARRAYSIZE(g_palette_names)) {
++                        g_palette_idx = (int)parsed;
++                    }
++                    continue;
++                }
++                if (strcmp(key, "video.filter") == 0) {
++                    long parsed = strtol(value, NULL, 10);
++                    if (parsed >= 0 && parsed < IM_ARRAYSIZE(g_render_filter_names)) {
++                        g_render_filter_mode = (GBRenderFilterMode)parsed;
++                    }
++                    continue;
++                }
++                if (strcmp(key, "video.scaling") == 0) {
++                    long parsed = strtol(value, NULL, 10);
++                    if (parsed >= 0 && parsed < IM_ARRAYSIZE(g_render_scaling_mode_names)) {
++                        g_render_scaling_mode = (GBRenderScalingMode)parsed;
++                    }
++                    continue;
++                }
++                if (strcmp(key, "video.lcd_grid") == 0) {
++                    g_lcd_grid_enabled = (strcmp(value, "0") != 0);
++                    continue;
++                }
++                if (strcmp(key, "touch.controls") == 0) {
++                    for (int mode = 0; mode < IM_ARRAYSIZE(g_touch_controls_mode_config); ++mode) {
++                        if (strcmp(value, g_touch_controls_mode_config[mode]) == 0) {
++                            g_touch_controls_mode = (GBTouchControlsMode)mode;
++                        }
++                    }
++                    continue;
++                }
++                if (strcmp(key, "rewind.enabled") == 0) {
++                    g_rewind_enabled = (strcmp(value, "0") != 0);
++                    continue;
++                }
++                if (strcmp(key, "video.unlimited_sprites") == 0) {
++                    gbrt_unlimited_sprites = (strcmp(value, "0") != 0);
++                    continue;
++                }
+                 if (strcmp(key, "savestate.slot") == 0) {
+                     long parsed = strtol(value, NULL, 10);
+                     if (parsed >= 0 && parsed < GB_SAVESTATE_SLOT_COUNT) {
+@@ -1112,6 +1231,9 @@ static void load_runtime_preferences(void) {
+                     continue;
+                 }
+ 
++                if (action == GB_INPUT_ACTION_REWIND) {
++                    saw_rewind_binding = true;
++                }
+                 if (is_keyboard) {
+                     g_keyboard_bindings[action][slot] = binding;
+                 } else {
+@@ -1141,6 +1263,31 @@ static void load_runtime_preferences(void) {
+         g_controller_bindings[GB_INPUT_ACTION_TOGGLE_MENU][1] =
+             make_binding(GB_INPUT_BINDING_NONE, 0);
+     }
++
++    /*
++     * Preferences written before Rewind existed persisted the old defaults
++     * (Select on Backspace, Toggle Max Speed on the left trigger), which now
++     * belong to Rewind. Drop exactly those legacy defaults so the new Rewind
++     * defaults do not fire two actions at once; any explicit rewind entry
++     * in the file means the user's current choices are authoritative.
++     */
++    if (!saw_rewind_binding) {
++        for (int slot = 0; slot < 2; ++slot) {
++            GBInputBinding& select_key = g_keyboard_bindings[GB_INPUT_ACTION_SELECT][slot];
++            if (select_key.kind == GB_INPUT_BINDING_KEY &&
++                select_key.code == SDL_SCANCODE_BACKSPACE) {
++                select_key = make_binding(GB_INPUT_BINDING_NONE, 0);
++            }
++            GBInputBinding& max_speed = g_controller_bindings[GB_INPUT_ACTION_TOGGLE_MAX_SPEED][slot];
++            if (max_speed.kind == GB_INPUT_BINDING_CONTROLLER_AXIS_POSITIVE &&
++                max_speed.code == SDL_CONTROLLER_AXIS_TRIGGERLEFT) {
++                max_speed = make_binding(GB_INPUT_BINDING_NONE, 0);
++            }
++        }
++    }
++    if (!g_rewind_enabled) {
++        rewind_clear(true);
++    }
+     update_effective_joypad_state();
+ }
+ 
+@@ -1193,6 +1340,13 @@ static void save_runtime_preferences(void) {
+             g_audio_volume_percent.load(std::memory_order_relaxed));
+     fprintf(file, "audio.device_name=%s\n", g_audio_target_device_name.c_str());
+     fprintf(file, "savestate.slot=%d\n", g_savestate_slot);
++    fprintf(file, "video.unlimited_sprites=%d\n", gbrt_unlimited_sprites ? 1 : 0);
++    fprintf(file, "video.palette=%d\n", g_palette_idx);
++    fprintf(file, "video.filter=%d\n", (int)g_render_filter_mode);
++    fprintf(file, "video.scaling=%d\n", (int)g_render_scaling_mode);
++    fprintf(file, "video.lcd_grid=%d\n", g_lcd_grid_enabled ? 1 : 0);
++    fprintf(file, "rewind.enabled=%d\n", g_rewind_enabled ? 1 : 0);
++    fprintf(file, "touch.controls=%s\n", g_touch_controls_mode_config[(int)g_touch_controls_mode]);
+ 
+     for (int action = 0; action < GB_INPUT_ACTION_COUNT; action++) {
+         for (int slot = 0; slot < 2; slot++) {
+@@ -1331,6 +1485,7 @@ static void update_runtime_action_state(GBContext* ctx) {
+                     break;
+ 
+                 case GB_INPUT_ACTION_FAST_FORWARD:
++                case GB_INPUT_ACTION_REWIND:
+                 case GB_INPUT_ACTION_RIGHT:
+                 case GB_INPUT_ACTION_LEFT:
+                 case GB_INPUT_ACTION_UP:
+@@ -1348,7 +1503,8 @@ static void update_runtime_action_state(GBContext* ctx) {
+         g_runtime_action_pressed[action] = pressed;
+     }
+ 
+-    g_fast_forward_active = g_runtime_action_pressed[GB_INPUT_ACTION_FAST_FORWARD];
++    g_fast_forward_active = g_runtime_action_pressed[GB_INPUT_ACTION_FAST_FORWARD] ||
++                            g_touch_fast_forward_held;
+ 
+     if (effective_speed_percent() != previous_effective_speed) {
+         reset_audio_output_buffer(true);
+@@ -1371,8 +1527,8 @@ static void rebuild_manual_joypad_state_from_bindings(void) {
+ 
+ static void update_effective_joypad_state(void) {
+     rebuild_manual_joypad_state_from_bindings();
+-    g_joypad_dpad = g_manual_joypad_dpad & g_script_joypad_dpad;
+-    g_joypad_buttons = g_manual_joypad_buttons & g_script_joypad_buttons;
++    g_joypad_dpad = g_manual_joypad_dpad & g_script_joypad_dpad & g_touch_joypad_dpad;
++    g_joypad_buttons = g_manual_joypad_buttons & g_script_joypad_buttons & g_touch_joypad_buttons;
+ }
+ 
+ static void request_joypad_interrupt(GBContext* ctx) {
+@@ -1740,6 +1896,290 @@ static void update_render_filter(void) {
+ #endif
+ }
+ 
++static void update_game_viewport(void);
++
++/* ============================================================================
++ * Touch controls (portrait)
++ *
++ * In portrait windows the game image is anchored to the top and the area below
++ * it hosts an on-screen D-pad, A/B, Select/Start, plus Rewind, Fast Forward and
++ * Menu buttons. Fingers are tracked by SDL finger id so multi-touch works;
++ * a finger that lands on the D-pad keeps steering it until released, other
++ * fingers may slide between buttons. Mouse events SDL synthesizes from touch
++ * are never used for game input, so they only reach ImGui (menu by touch).
++ * ========================================================================== */
++/* Fraction of a portrait window reserved for the game image. */
++static constexpr float GB_TOUCH_GAME_AREA_FRACTION = 0.60f;
++static constexpr int GB_TOUCH_MAX_FINGERS = 10;
++
++typedef enum GBTouchZone {
++    GB_TOUCH_ZONE_NONE = 0,
++    GB_TOUCH_ZONE_DPAD = 1,
++    GB_TOUCH_ZONE_BUTTONS = 2,
++    GB_TOUCH_ZONE_MENU = 3,
++} GBTouchZone;
++
++typedef struct GBTouchFinger {
++    bool active;
++    SDL_FingerID id;
++    float x;
++    float y;
++    GBTouchZone zone;
++} GBTouchFinger;
++
++typedef struct GBTouchRect {
++    float x, y, w, h;
++} GBTouchRect;
++
++typedef struct GBTouchLayout {
++    bool valid;
++    float area_top;
++    float area_h;
++    float dpad_x, dpad_y, dpad_r;
++    float a_x, a_y, b_x, b_y, ab_r;
++    GBTouchRect select_rect, start_rect, rewind_rect, ff_rect, menu_rect;
++} GBTouchLayout;
++
++static GBTouchFinger g_touch_fingers[GB_TOUCH_MAX_FINGERS] = {};
++static GBTouchLayout g_touch_layout = {};
++static bool g_touch_layout_applied = false;
++
++static bool touch_controls_enabled(void) {
++    switch (g_touch_controls_mode) {
++        case GB_TOUCH_CONTROLS_ON:
++            return true;
++        case GB_TOUCH_CONTROLS_OFF:
++            return false;
++        case GB_TOUCH_CONTROLS_AUTO:
++        default:
++#if defined(__ANDROID__)
++            return g_controller == NULL;
++#else
++            return false;
++#endif
++    }
++}
++
++/* True when the portrait touch layout owns the lower part of the window. */
++static bool touch_layout_active(void) {
++    if (!g_window || g_benchmark_mode || !touch_controls_enabled()) {
++        return false;
++    }
++    int window_w = 0;
++    int window_h = 0;
++    SDL_GetWindowSize(g_window, &window_w, &window_h);
++    return window_w > 0 && window_h > window_w;
++}
++
++static bool touch_rect_contains(const GBTouchRect& rect, float x, float y, float slop) {
++    return x >= rect.x - slop && x <= rect.x + rect.w + slop &&
++           y >= rect.y - slop && y <= rect.y + rect.h + slop;
++}
++
++static void compute_touch_layout(void) {
++    g_touch_layout = {};
++    if (!touch_layout_active()) {
++        return;
++    }
++    int window_w = 0;
++    int window_h = 0;
++    SDL_GetWindowSize(g_window, &window_w, &window_h);
++    const float w = (float)window_w;
++    const float top = (float)(g_game_viewport.y + g_game_viewport.h);
++    const float area_h = (float)window_h - top;
++    if (area_h < 80.0f) {
++        return;
++    }
++
++    GBTouchLayout& l = g_touch_layout;
++    l.valid = true;
++    l.area_top = top;
++    l.area_h = area_h;
++
++    l.dpad_r = std::fmin(w * 0.20f, area_h * 0.28f);
++    l.dpad_x = w * 0.25f;
++    l.dpad_y = top + area_h * 0.47f;
++
++    l.ab_r = std::fmin(w * 0.095f, area_h * 0.12f);
++    l.a_x = w * 0.84f;
++    l.a_y = top + area_h * 0.38f;
++    l.b_x = w * 0.64f;
++    l.b_y = top + area_h * 0.52f;
++
++    const float small_w = w * 0.15f;
++    const float small_h = std::fmax(area_h * 0.06f, 24.0f);
++    const float pill_y = top + area_h * 0.84f;
++    l.select_rect = { w * 0.40f - small_w * 0.5f, pill_y, small_w, small_h };
++    l.start_rect = { w * 0.60f - small_w * 0.5f, pill_y, small_w, small_h };
++
++    const float bar_y = top + area_h * 0.04f;
++    const float bar_w = w * 0.16f;
++    l.rewind_rect = { w * 0.04f, bar_y, bar_w, small_h };
++    l.ff_rect = { w * 0.04f + bar_w + w * 0.03f, bar_y, bar_w, small_h };
++    l.menu_rect = { w * 0.96f - bar_w, bar_y, bar_w, small_h };
++}
++
++static void clear_touch_state(void) {
++    for (GBTouchFinger& finger : g_touch_fingers) {
++        finger = {};
++    }
++    g_touch_joypad_dpad = 0xFF;
++    g_touch_joypad_buttons = 0xFF;
++    g_touch_rewind_held = false;
++    g_touch_fast_forward_held = false;
++}
++
++static GBTouchZone touch_zone_at(float x, float y) {
++    const GBTouchLayout& l = g_touch_layout;
++    if (!l.valid || y < l.area_top) {
++        return GB_TOUCH_ZONE_NONE;
++    }
++    const float slop = l.ab_r * 0.25f;
++    if (touch_rect_contains(l.menu_rect, x, y, slop)) {
++        return GB_TOUCH_ZONE_MENU;
++    }
++    const float dx = x - l.dpad_x;
++    const float dy = y - l.dpad_y;
++    if (dx * dx + dy * dy <= (l.dpad_r * 1.3f) * (l.dpad_r * 1.3f)) {
++        return GB_TOUCH_ZONE_DPAD;
++    }
++    return GB_TOUCH_ZONE_BUTTONS;
++}
++
++/* Recompute the touch joypad mask and hold actions from all active fingers. */
++static void recompute_touch_inputs(void) {
++    const GBTouchLayout& l = g_touch_layout;
++    uint8_t dpad = 0xFF;
++    uint8_t buttons = 0xFF;
++    bool rewind = false;
++    bool fast_forward = false;
++
++    for (const GBTouchFinger& finger : g_touch_fingers) {
++        if (!finger.active || !l.valid) {
++            continue;
++        }
++        if (finger.zone == GB_TOUCH_ZONE_DPAD) {
++            const float dx = finger.x - l.dpad_x;
++            const float dy = finger.y - l.dpad_y;
++            const float dead = l.dpad_r * 0.18f;
++            if (dx * dx + dy * dy < dead * dead) {
++                continue;
++            }
++            /* 8-way: an axis is active when the finger is within 67.5 degrees
++             * of it (tan(22.5) = 0.4142), so diagonals cover 45-degree arcs. */
++            const float ax = std::fabs(dx);
++            const float ay = std::fabs(dy);
++            if (ax > ay * 0.4142f) {
++                dpad &= (uint8_t)~(dx > 0.0f ? 0x01 : 0x02);
++            }
++            if (ay > ax * 0.4142f) {
++                dpad &= (uint8_t)~(dy > 0.0f ? 0x08 : 0x04);
++            }
++        } else if (finger.zone == GB_TOUCH_ZONE_BUTTONS) {
++            const float hit = l.ab_r * 1.35f;
++            const float adx = finger.x - l.a_x;
++            const float ady = finger.y - l.a_y;
++            const float bdx = finger.x - l.b_x;
++            const float bdy = finger.y - l.b_y;
++            if (adx * adx + ady * ady <= hit * hit) buttons &= (uint8_t)~0x01;
++            if (bdx * bdx + bdy * bdy <= hit * hit) buttons &= (uint8_t)~0x02;
++            const float slop = l.ab_r * 0.25f;
++            if (touch_rect_contains(l.select_rect, finger.x, finger.y, slop)) buttons &= (uint8_t)~0x04;
++            if (touch_rect_contains(l.start_rect, finger.x, finger.y, slop)) buttons &= (uint8_t)~0x08;
++            if (touch_rect_contains(l.rewind_rect, finger.x, finger.y, slop)) rewind = true;
++            if (touch_rect_contains(l.ff_rect, finger.x, finger.y, slop)) fast_forward = true;
++        }
++    }
++
++    g_touch_joypad_dpad = dpad;
++    g_touch_joypad_buttons = buttons;
++    g_touch_rewind_held = rewind;
++    g_touch_fast_forward_held = fast_forward;
++}
++
++/* Re-evaluate the layout once per presented frame; resizes, rotation and
++ * controller hot-plug all flow through here. */
++static void refresh_touch_layout_state(void) {
++    const bool active = touch_layout_active();
++    if (active != g_touch_layout_applied) {
++        g_touch_layout_applied = active;
++        clear_touch_state();
++        update_effective_joypad_state();
++        update_game_viewport();
++    }
++    if (g_show_menu && (g_touch_joypad_dpad != 0xFF || g_touch_joypad_buttons != 0xFF ||
++                        g_touch_rewind_held || g_touch_fast_forward_held)) {
++        clear_touch_state();
++        update_effective_joypad_state();
++    }
++}
++
++static void draw_touch_label(ImDrawList* draw_list, float cx, float cy, float size,
++                             ImU32 color, const char* text) {
++    ImFont* font = ImGui::GetFont();
++    const ImVec2 extent = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
++    draw_list->AddText(font, size, ImVec2(cx - extent.x * 0.5f, cy - extent.y * 0.5f), color, text);
++}
++
++static void draw_touch_rect_button(ImDrawList* draw_list, const GBTouchRect& rect, bool pressed,
++                                   const char* text) {
++    const ImU32 fill = pressed ? IM_COL32(255, 255, 255, 110) : IM_COL32(255, 255, 255, 45);
++    draw_list->AddRectFilled(ImVec2(rect.x, rect.y), ImVec2(rect.x + rect.w, rect.y + rect.h),
++                             fill, rect.h * 0.5f);
++    draw_list->AddRect(ImVec2(rect.x, rect.y), ImVec2(rect.x + rect.w, rect.y + rect.h),
++                       IM_COL32(255, 255, 255, 90), rect.h * 0.5f, 0, 2.0f);
++    draw_touch_label(draw_list, rect.x + rect.w * 0.5f, rect.y + rect.h * 0.5f, rect.h * 0.55f,
++                     IM_COL32(255, 255, 255, 200), text);
++}
++
++static void draw_touch_controls(void) {
++    const GBTouchLayout& l = g_touch_layout;
++    if (!g_touch_layout_applied || !l.valid || g_show_menu) {
++        return;
++    }
++    ImDrawList* dl = ImGui::GetBackgroundDrawList();
++    const ImU32 base = IM_COL32(255, 255, 255, 40);
++    const ImU32 lit = IM_COL32(255, 255, 255, 120);
++    const ImU32 edge = IM_COL32(255, 255, 255, 90);
++    const ImU32 label = IM_COL32(255, 255, 255, 210);
++
++    /* D-pad: a plus shape with each arm lit while pressed. */
++    const float arm = l.dpad_r * 0.36f;
++    const float r = l.dpad_r;
++    const float cx = l.dpad_x;
++    const float cy = l.dpad_y;
++    dl->AddCircleFilled(ImVec2(cx, cy), r * 1.05f, IM_COL32(255, 255, 255, 18), 48);
++    dl->AddRectFilled(ImVec2(cx - arm, cy - arm), ImVec2(cx + arm, cy + arm), base);
++    const struct { uint8_t bit; float x0, y0, x1, y1; const char* text; float lx, ly; } arms[] = {
++        { 0x04, cx - arm, cy - r, cx + arm, cy - arm, "^", cx, cy - (r + arm) * 0.5f },
++        { 0x08, cx - arm, cy + arm, cx + arm, cy + r, "v", cx, cy + (r + arm) * 0.5f },
++        { 0x02, cx - r, cy - arm, cx - arm, cy + arm, "<", cx - (r + arm) * 0.5f, cy },
++        { 0x01, cx + arm, cy - arm, cx + r, cy + arm, ">", cx + (r + arm) * 0.5f, cy },
++    };
++    for (const auto& a : arms) {
++        const bool pressed = !(g_touch_joypad_dpad & a.bit);
++        dl->AddRectFilled(ImVec2(a.x0, a.y0), ImVec2(a.x1, a.y1), pressed ? lit : base, arm * 0.3f);
++        draw_touch_label(dl, a.lx, a.ly, arm * 1.1f, label, a.text);
++    }
++    dl->AddCircle(ImVec2(cx, cy), r * 1.05f, edge, 48, 2.0f);
++
++    /* A and B */
++    const bool a_pressed = !(g_touch_joypad_buttons & 0x01);
++    const bool b_pressed = !(g_touch_joypad_buttons & 0x02);
++    dl->AddCircleFilled(ImVec2(l.a_x, l.a_y), l.ab_r, a_pressed ? lit : base, 40);
++    dl->AddCircle(ImVec2(l.a_x, l.a_y), l.ab_r, edge, 40, 2.0f);
++    draw_touch_label(dl, l.a_x, l.a_y, l.ab_r * 0.9f, label, "A");
++    dl->AddCircleFilled(ImVec2(l.b_x, l.b_y), l.ab_r, b_pressed ? lit : base, 40);
++    dl->AddCircle(ImVec2(l.b_x, l.b_y), l.ab_r, edge, 40, 2.0f);
++    draw_touch_label(dl, l.b_x, l.b_y, l.ab_r * 0.9f, label, "B");
++
++    draw_touch_rect_button(dl, l.select_rect, !(g_touch_joypad_buttons & 0x04), "SELECT");
++    draw_touch_rect_button(dl, l.start_rect, !(g_touch_joypad_buttons & 0x08), "START");
++    draw_touch_rect_button(dl, l.rewind_rect, g_touch_rewind_held, "<< REW");
++    draw_touch_rect_button(dl, l.ff_rect, g_touch_fast_forward_held, "FF >>");
++    draw_touch_rect_button(dl, l.menu_rect, false, "MENU");
++}
++
+ static void update_game_viewport(void) {
+     if (!g_window) {
+         g_game_viewport.x = 0;
+@@ -1755,6 +2195,14 @@ static void update_game_viewport(void) {
+     if (window_w <= 0) window_w = GB_SCREEN_WIDTH;
+     if (window_h <= 0) window_h = GB_SCREEN_HEIGHT;
+ 
++    /* Portrait touch layout: the image gets the upper part of the window and
++     * is anchored to the top; the rest hosts the touch controls. */
++    const bool touch_portrait = touch_layout_active();
++    if (touch_portrait) {
++        window_h = (int)((float)window_h * GB_TOUCH_GAME_AREA_FRACTION);
++        if (window_h < GB_SCREEN_HEIGHT) window_h = GB_SCREEN_HEIGHT;
++    }
++
+     int viewport_w = window_w;
+     int viewport_h = window_h;
+ 
+@@ -1805,7 +2253,8 @@ static void update_game_viewport(void) {
+     g_game_viewport.w = viewport_w;
+     g_game_viewport.h = viewport_h;
+     g_game_viewport.x = (window_w - viewport_w) / 2;
+-    g_game_viewport.y = (window_h - viewport_h) / 2;
++    g_game_viewport.y = touch_portrait ? 0 : (window_h - viewport_h) / 2;
++    compute_touch_layout();
+ }
+ 
+ static void apply_window_scale_preset(void) {
+@@ -1894,6 +2343,7 @@ static void reset_runtime_display_defaults(void) {
+     g_max_speed_mode = false;
+     g_render_scaling_mode = GB_RENDER_SCALING_PIXEL_PERFECT;
+     g_render_filter_mode = GB_RENDER_FILTER_NEAREST;
++    g_lcd_grid_enabled = false;
+     update_render_filter();
+ 
+     if (g_renderer) {
+@@ -1915,6 +2365,7 @@ static void reset_runtime_display_defaults(void) {
+     }
+ 
+     reset_audio_output_buffer(true);
++    save_runtime_preferences();
+ }
+ 
+ static void reset_runtime_audio_defaults(void) {
+@@ -2091,11 +2542,45 @@ static void ensure_lcd_off_framebuffer(void) {
+     g_lcd_off_framebuffer_initialized = true;
+ }
+ 
++/* Subtle LCD pixel grid: thin translucent lines on every Game Boy pixel
++ * boundary. Only drawn when each Game Boy pixel spans at least 3 host pixels
++ * so the grid never swallows the image. */
++static void draw_lcd_grid_overlay(void) {
++    if (!g_lcd_grid_enabled || !g_renderer) {
++        return;
++    }
++    const SDL_Rect vp = g_game_viewport;
++    const double scale_x = (double)vp.w / (double)GB_SCREEN_WIDTH;
++    const double scale_y = (double)vp.h / (double)GB_SCREEN_HEIGHT;
++    if (scale_x < 3.0 || scale_y < 3.0) {
++        return;
++    }
++    const int thickness = (scale_x >= 8.0 && scale_y >= 8.0) ? 2 : 1;
++    static SDL_Rect rects[GB_SCREEN_WIDTH + GB_SCREEN_HEIGHT];
++    int count = 0;
++    for (int x = 1; x < GB_SCREEN_WIDTH; ++x) {
++        const int px = vp.x + (int)((double)x * scale_x);
++        rects[count++] = SDL_Rect{px, vp.y, thickness, vp.h};
++    }
++    for (int y = 1; y < GB_SCREEN_HEIGHT; ++y) {
++        const int py = vp.y + (int)((double)y * scale_y);
++        rects[count++] = SDL_Rect{vp.x, py, vp.w, thickness};
++    }
++    SDL_BlendMode previous_blend = SDL_BLENDMODE_NONE;
++    SDL_GetRenderDrawBlendMode(g_renderer, &previous_blend);
++    SDL_SetRenderDrawBlendMode(g_renderer, SDL_BLENDMODE_BLEND);
++    SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 40);
++    SDL_RenderFillRects(g_renderer, rects, count);
++    SDL_SetRenderDrawBlendMode(g_renderer, previous_blend);
++}
++
+ // Keep texture layout and host palette conversion in the same tested path.
+ static void copy_display_frame(void* pixels, int pitch, const uint32_t* framebuffer,
+                                int palette_idx, const GBContext* ctx) {
+-    const bool recolor = palette_idx > 0 && palette_idx < IM_ARRAYSIZE(g_palettes) &&
+-        (!ctx || ctx->config.model != GB_MODEL_CGB);
++    const bool dmg_display = !ctx || ctx->config.model != GB_MODEL_CGB;
++    const bool colorized = palette_idx == GB_PALETTE_COLORIZED && dmg_display;
++    const bool recolor = colorized ||
++        (palette_idx > 0 && palette_idx < IM_ARRAYSIZE(g_palettes) && dmg_display);
+     uint32_t source_palette[4];
+     if (recolor) {
+         for (int shade = 0; shade < 4; ++shade) {
+@@ -2109,13 +2594,24 @@ static void copy_display_frame(void* pixels, int pitch, const uint32_t* framebuf
+             memcpy(dst, src, GB_SCREEN_WIDTH * sizeof(uint32_t));
+             continue;
+         }
++        const uint8_t* layers = g_last_guest_layer_buffer + y * GB_SCREEN_WIDTH;
++        const uint32_t sky = colorized
++            ? lerp_argb(g_colorized_sky_top, g_colorized_sky_bottom, y, GB_SCREEN_HEIGHT - 1)
++            : 0;
+         for (int x = 0; x < GB_SCREEN_WIDTH; ++x) {
+             dst[x] = src[x];
+             for (int shade = 0; shade < 4; ++shade) {
+                 // Completed frames use the PPU's RGB555-expanded colors;
+                 // startup and LCD-off frames can still use the legacy colors.
+                 if (src[x] == source_palette[shade] || src[x] == g_palettes[0][shade]) {
+-                    dst[x] = g_palettes[palette_idx][shade];
++                    if (colorized) {
++                        const uint8_t layer = layers[x] <= PPU_LAYER_WIN ? layers[x] : 0;
++                        dst[x] = (layer == PPU_LAYER_BG && shade == 0)
++                            ? sky
++                            : g_colorized_palettes[layer][shade];
++                    } else {
++                        dst[x] = g_palettes[palette_idx][shade];
++                    }
+                     break;
+                 }
+             }
+@@ -2141,6 +2637,8 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
+     if (count_guest_frame) {
+         g_frame_count++;
+         memcpy(g_last_guest_framebuffer, framebuffer, sizeof(g_last_guest_framebuffer));
++        memcpy(g_last_guest_layer_buffer, ppu_get_layer_buffer(),
++               sizeof(g_last_guest_layer_buffer));
+         g_last_guest_framebuffer_valid = true;
+     }
+ 
+@@ -2240,7 +2738,9 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
+     double compose_start_ms = sdl_now_ms();
+     SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
+     SDL_RenderClear(g_renderer);
++    refresh_touch_layout_state();
+     SDL_RenderCopy(g_renderer, g_texture, NULL, &g_game_viewport);
++    draw_lcd_grid_overlay();
+ 
+     ImGui_ImplSDLRenderer2_NewFrame();
+     ImGui_ImplSDL2_NewFrame();
+@@ -2310,6 +2810,7 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
+                          IM_ARRAYSIZE(g_render_scaling_mode_names))) {
+             g_render_scaling_mode = (GBRenderScalingMode)scaling_mode;
+             update_game_viewport();
++            save_runtime_preferences();
+         }
+ 
+         int filter_mode = (int)g_render_filter_mode;
+@@ -2319,6 +2820,23 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
+                          IM_ARRAYSIZE(g_render_filter_names))) {
+             g_render_filter_mode = (GBRenderFilterMode)filter_mode;
+             update_render_filter();
++            save_runtime_preferences();
++        }
++        if (ImGui::Checkbox("LCD Grid", &g_lcd_grid_enabled)) {
++            save_runtime_preferences();
++        }
++        int touch_mode = (int)g_touch_controls_mode;
++        if (ImGui::Combo("Touch Controls",
++                         &touch_mode,
++                         g_touch_controls_mode_names,
++                         IM_ARRAYSIZE(g_touch_controls_mode_names))) {
++            g_touch_controls_mode = (GBTouchControlsMode)touch_mode;
++            save_runtime_preferences();
++        }
++        ImGui::TextDisabled("Touch controls appear in portrait; Auto shows them on Android without a controller.");
++        if (g_lcd_grid_enabled &&
++            (g_game_viewport.w < GB_SCREEN_WIDTH * 3 || g_game_viewport.h < GB_SCREEN_HEIGHT * 3)) {
++            ImGui::TextDisabled("LCD Grid needs a viewport of at least 3x.");
+         }
+ 
+         if (!g_fullscreen) {
+@@ -2342,6 +2860,17 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
+ 
+         ImGui::Checkbox("Show Overlay", &g_show_overlay);
+         ImGui::Checkbox("Smooth Slow Frames", &g_smooth_lcd_transitions);
++        if (ImGui::Checkbox("Rewind (hold Backspace / Left Trigger)", &g_rewind_enabled)) {
++            if (!g_rewind_enabled) {
++                rewind_clear(true);
++            }
++            save_runtime_preferences();
++        }
++        if (g_rewind_enabled) {
++            ImGui::TextDisabled("Rewind buffer: %.1f s, %.1f MB",
++                                (double)(g_rewind_count * GB_REWIND_SNAPSHOT_INTERVAL) / 59.73,
++                                (double)rewind_memory_bytes() / (1024.0 * 1024.0));
++        }
+         if (ImGui::SliderInt("Speed %", &g_speed_percent, 10, 500)) {
+             reset_audio_output_buffer(true);
+         }
+@@ -2359,11 +2888,16 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
+         const bool cgb_colors = g_registered_ctx &&
+             g_registered_ctx->config.model == GB_MODEL_CGB;
+         ImGui::BeginDisabled(cgb_colors);
+-        ImGui::Combo("Palette", &g_palette_idx, g_palette_names, IM_ARRAYSIZE(g_palette_names));
++        if (ImGui::Combo("Palette", &g_palette_idx, g_palette_names, IM_ARRAYSIZE(g_palette_names))) {
++            save_runtime_preferences();
++        }
+         ImGui::EndDisabled();
+         if (cgb_colors) {
+             ImGui::TextDisabled("Game Boy Color uses the game's color palettes.");
+         }
++        if (ImGui::Checkbox("Unlimited Sprites (No Flicker)", &gbrt_unlimited_sprites)) {
++            save_runtime_preferences();
++        }
+ 
+         ImGui::Separator();
+         ImGui::TextDisabled("Audio");
+@@ -2665,6 +3199,7 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
+         }
+     }
+ 
++    draw_touch_controls();
+     ImGui::Render();
+     ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData());
+     g_last_timing.compose_ms = sdl_now_ms() - compose_start_ms;
+@@ -2681,6 +3216,7 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
+  * ========================================================================== */
+ 
+ void gb_platform_shutdown(void) {
++    rewind_clear(true);
+     close_input_record_file();
+     close_audio_output_device();
+     g_audio_output_devices.clear();
+@@ -2972,7 +3508,8 @@ static void sdl_audio_callback(void* userdata, Uint8* stream, int len) {
+     (void)userdata;
+     int16_t* out = (int16_t*)stream;
+     const uint32_t samples_needed = (uint32_t)(len / 4);
+-    const bool muted = g_audio_muted.load(std::memory_order_relaxed);
++    const bool muted = g_audio_muted.load(std::memory_order_relaxed) ||
++                       g_rewind_active.load(std::memory_order_relaxed);
+     const uint32_t volume_percent = g_audio_volume_percent.load(std::memory_order_relaxed);
+     const uint32_t write_pos = g_audio_write_pos.load(std::memory_order_acquire);
+     uint32_t read_pos = g_audio_read_pos.load(std::memory_order_relaxed);
+@@ -3317,6 +3854,81 @@ static bool handle_binding_capture_event(const SDL_Event* event) {
+     }
+ }
+ 
++static void handle_touch_finger_event(const SDL_Event* event, GBContext* ctx,
++                                      bool dpad_selected, bool buttons_selected) {
++    if (!g_touch_layout_applied || !g_touch_layout.valid || g_show_menu || !g_window) {
++        return;
++    }
++    int window_w = 0;
++    int window_h = 0;
++    SDL_GetWindowSize(g_window, &window_w, &window_h);
++    const float x = event->tfinger.x * (float)window_w;
++    const float y = event->tfinger.y * (float)window_h;
++    const SDL_FingerID id = event->tfinger.fingerId;
++
++    GBTouchFinger* finger = NULL;
++    for (GBTouchFinger& candidate : g_touch_fingers) {
++        if (candidate.active && candidate.id == id) {
++            finger = &candidate;
++            break;
++        }
++    }
++
++    if (event->type == SDL_FINGERDOWN) {
++        const GBTouchZone zone = touch_zone_at(x, y);
++        if (zone == GB_TOUCH_ZONE_NONE) {
++            return;
++        }
++        if (zone == GB_TOUCH_ZONE_MENU) {
++            g_show_menu = true;
++            clear_touch_state();
++            update_effective_joypad_state();
++            update_runtime_action_state(ctx);
++            return;
++        }
++        if (!finger) {
++            for (GBTouchFinger& candidate : g_touch_fingers) {
++                if (!candidate.active) {
++                    finger = &candidate;
++                    break;
++                }
++            }
++        }
++        if (!finger) {
++            return;
++        }
++        finger->active = true;
++        finger->id = id;
++        finger->zone = zone;
++        finger->x = x;
++        finger->y = y;
++    } else if (!finger) {
++        return;
++    } else if (event->type == SDL_FINGERMOTION) {
++        finger->x = x;
++        finger->y = y;
++    } else {
++        *finger = {};
++    }
++
++    const uint8_t previous_dpad = g_joypad_dpad;
++    const uint8_t previous_buttons = g_joypad_buttons;
++    recompute_touch_inputs();
++    update_effective_joypad_state();
++    update_runtime_action_state(ctx);
++    const bool port_captured = dispatch_captured_port_input(
++        ctx, previous_dpad, previous_buttons);
++    if (ctx && !port_captured &&
++        input_transition_creates_press(previous_dpad,
++                                       previous_buttons,
++                                       g_joypad_dpad,
++                                       g_joypad_buttons,
++                                       dpad_selected,
++                                       buttons_selected)) {
++        request_joypad_interrupt(ctx);
++    }
++}
++
+ static bool handle_runtime_event(const SDL_Event* event, GBContext* ctx) {
+     if (!event) {
+         return true;
+@@ -3509,6 +4121,12 @@ static bool handle_runtime_event(const SDL_Event* event, GBContext* ctx) {
+             break;
+         }
+ 
++        case SDL_FINGERDOWN:
++        case SDL_FINGERMOTION:
++        case SDL_FINGERUP:
++            handle_touch_finger_event(event, ctx, dpad_selected, buttons_selected);
++            break;
++
+         case SDL_WINDOWEVENT:
+             if (event->window.event == SDL_WINDOWEVENT_RESIZED ||
+                 event->window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+@@ -3612,7 +4230,95 @@ void gb_platform_submit_port_frame(void* user, const GBPortFrame* frame) {
+ 
+ 
+ 
++static void rewind_clear(bool free_memory) {
++    g_rewind_head = 0;
++    g_rewind_count = 0;
++    g_rewind_frame_counter = 0;
++    if (free_memory) {
++        for (int i = 0; i < GB_REWIND_CAPACITY; ++i) {
++            free(g_rewind_slots[i]);
++            g_rewind_slots[i] = NULL;
++        }
++        g_rewind_state_size = 0;
++    }
++}
++
++static size_t rewind_memory_bytes(void) {
++    size_t total = 0;
++    for (int i = 0; i < GB_REWIND_CAPACITY; ++i) {
++        if (g_rewind_slots[i]) {
++            total += g_rewind_state_size;
++        }
++    }
++    return total;
++}
++
++/* Runs once per completed guest frame, between gb_run_cycles() calls (the
++ * same boundary used by manual savestates). While the Rewind action is held
++ * each frame restores the newest snapshot and drops it, so playback runs
++ * backwards at GB_REWIND_SNAPSHOT_INTERVAL x speed; the oldest snapshot is
++ * kept so holding past the buffer start freezes there. */
++static void rewind_on_guest_frame(GBContext* ctx) {
++    const bool want_rewind = g_rewind_enabled && ctx != NULL && !g_benchmark_mode &&
++        !g_show_menu &&
++        (g_runtime_action_pressed[GB_INPUT_ACTION_REWIND] || g_touch_rewind_held);
++
++    if (want_rewind) {
++        g_rewind_active.store(true, std::memory_order_relaxed);
++        g_rewind_frame_counter = 0;
++        if (g_rewind_count > 0) {
++            const int index = (g_rewind_head + GB_REWIND_CAPACITY - 1) % GB_REWIND_CAPACITY;
++            if (g_rewind_slots[index] &&
++                gb_context_load_state_buffer(ctx, g_rewind_slots[index], g_rewind_state_size)) {
++                g_last_frame_time = SDL_GetTicks();
++            }
++            if (g_rewind_count > 1) {
++                g_rewind_head = index;
++                g_rewind_count--;
++            }
++        }
++        reset_audio_output_buffer(true);
++        return;
++    }
++
++    if (g_rewind_active.load(std::memory_order_relaxed)) {
++        g_rewind_active.store(false, std::memory_order_relaxed);
++        reset_audio_output_buffer(true);
++    }
++    if (!g_rewind_enabled || ctx == NULL || g_benchmark_mode) {
++        return;
++    }
++    if (++g_rewind_frame_counter < GB_REWIND_SNAPSHOT_INTERVAL) {
++        return;
++    }
++    g_rewind_frame_counter = 0;
++
++    const size_t state_size = gb_context_state_size(ctx);
++    if (state_size == 0) {
++        return;
++    }
++    if (state_size != g_rewind_state_size) {
++        rewind_clear(true);
++        g_rewind_state_size = state_size;
++    }
++    uint8_t*& slot = g_rewind_slots[g_rewind_head];
++    if (!slot) {
++        slot = (uint8_t*)malloc(state_size);
++        if (!slot) {
++            return; /* Out of memory: keep the snapshots we already have. */
++        }
++    }
++    if (!gb_context_save_state_buffer(ctx, slot, state_size, NULL)) {
++        return;
++    }
++    g_rewind_head = (g_rewind_head + 1) % GB_REWIND_CAPACITY;
++    if (g_rewind_count < GB_REWIND_CAPACITY) {
++        g_rewind_count++;
++    }
++}
++
+ void gb_platform_render_frame(const uint32_t* framebuffer) {
++    rewind_on_guest_frame(g_registered_ctx);
+     render_frame_internal(framebuffer, true);
+ }
+ 
+@@ -3868,6 +4574,7 @@ static bool load_savestate_slot(GBContext* ctx, int slot) {
+     sdl_get_savestate_path(filename, sizeof(filename), ctx, slot);
+     const bool success = gb_context_load_state_file(ctx, filename);
+     if (success) {
++        rewind_clear(false);
+         reset_audio_output_buffer(true);
+         g_last_guest_framebuffer_valid = false;
+         g_present_count = ctx->completed_frames;
+@@ -4125,6 +4832,7 @@ static bool sdl_save_rtc_data(GBContext* ctx, const char* rom_name, const void*
+ 
+ void gb_platform_register_context(GBContext* ctx) {
+     g_registered_ctx = ctx;
++    rewind_clear(false);
+     GBPlatformCallbacks callbacks = {
+         .on_audio_sample = on_audio_sample,
+         .load_battery_ram = sdl_load_battery_ram,
+diff --git a/runtime/src/ppu.c b/runtime/src/ppu.c
+index d3f7060..7603158 100644
+--- a/runtime/src/ppu.c
++++ b/runtime/src/ppu.c
+@@ -270,6 +270,14 @@ static void latch_scanline_registers(GBPPU* ppu) {
+  * PPU Initialization
+  * ========================================================================== */
+ 
++/* Per-pixel source layer of the last emitted pixels (PPU_LAYER_*). Used only
++ * by host colorization; kept outside GBPPU so savestates are unchanged. */
++static uint8_t ppu_layer_buffer[GB_FRAMEBUFFER_SIZE];
++
++const uint8_t* ppu_get_layer_buffer(void) {
++    return ppu_layer_buffer;
++}
++
+ void ppu_init(GBPPU* ppu) {
+     memset(ppu, 0, sizeof(*ppu));
+     ppu_reset(ppu, NULL);
+@@ -282,6 +290,7 @@ void ppu_reset(GBPPU* ppu, const GBContext* ctx) {
+     uint16_t default_color = cgb_mode ? 0x7FFF : dmg_palette_rgb555[0];
+ 
+     memset(ppu->framebuffer, 0, sizeof(ppu->framebuffer));
++    memset(ppu_layer_buffer, PPU_LAYER_BG, sizeof(ppu_layer_buffer));
+     for (size_t i = 0; i < GB_FRAMEBUFFER_SIZE; i++) {
+         ppu->color_framebuffer[i] = default_color;
+         ppu->rgb_framebuffer[i] = cgb_mode ? rgb555_to_rgba(default_color) : dmg_palette_rgba[0];
+@@ -891,6 +900,18 @@ static DotBackgroundPixel ppu_fetch_background_dot(const GBPPU* ppu,
+     return pixel;
+ }
+ 
++/* Render-only sprite list for the current scanline. When unlimited sprites
++ * are enabled it holds every OAM entry that intersects the line instead of
++ * the first ten. It intentionally lives outside GBPPU so savestate layout
++ * (which embeds sizeof(GBPPU)) is unchanged; mode-3 timing keeps using the
++ * hardware-accurate visible_sprite_* selection. */
++static uint8_t render_sprite_count = 0;
++static uint8_t render_sprite_indices[40];
++static uint8_t render_sprite_x[40];
++static uint8_t render_sprite_y[40];
++static const GBPPU* render_sprite_owner = NULL;
++static int render_sprite_ly = -1;
++
+ static DotObjectPixel ppu_fetch_object_dot(const GBPPU* ppu,
+                                             const GBContext* ctx) {
+     DotObjectPixel chosen = {false, 0, 0, false};
+@@ -903,9 +924,26 @@ static DotObjectPixel ppu_fetch_object_dot(const GBPPU* ppu,
+         return chosen;
+     }
+ 
+-    for (uint8_t slot = 0; slot < ppu->visible_sprite_count; ++slot) {
+-        const int oam_index = ppu->visible_sprite_indices[slot];
+-        const int screen_x = (int)ppu->visible_sprite_x[slot] - 8;
++    /* Fall back to the timing list when the render list is stale, e.g.
++     * right after a savestate load in the middle of mode 3. */
++    const bool use_render_list = render_sprite_owner == ppu &&
++                                 render_sprite_ly == (int)ppu->ly;
++    const uint8_t sprite_count = use_render_list
++        ? render_sprite_count
++        : ppu->visible_sprite_count;
++    const uint8_t* sprite_indices = use_render_list
++        ? render_sprite_indices
++        : ppu->visible_sprite_indices;
++    const uint8_t* sprite_x = use_render_list
++        ? render_sprite_x
++        : ppu->visible_sprite_x;
++    const uint8_t* sprite_y = use_render_list
++        ? render_sprite_y
++        : ppu->visible_sprite_y;
++
++    for (uint8_t slot = 0; slot < sprite_count; ++slot) {
++        const int oam_index = sprite_indices[slot];
++        const int screen_x = (int)sprite_x[slot] - 8;
+         const int sprite_pixel = (int)ppu->draw_x - screen_x;
+         if (sprite_pixel < 0 || sprite_pixel >= 8) {
+             continue;
+@@ -914,7 +952,7 @@ static DotObjectPixel ppu_fetch_object_dot(const GBPPU* ppu,
+         const size_t oam_offset = (size_t)oam_index * 4u;
+         const uint8_t tile_byte = ctx->oam[oam_offset + 2u];
+         const uint8_t flags = ctx->oam[oam_offset + 3u];
+-        int line = (int)ppu->ly - ((int)ppu->visible_sprite_y[slot] - 16);
++        int line = (int)ppu->ly - ((int)sprite_y[slot] - 16);
+         uint8_t tile = tile_byte;
+         uint8_t bank = 0;
+         if (ppu->line_sprite_height == 16) {
+@@ -989,12 +1027,16 @@ static void ppu_render_dot(GBPPU* ppu, GBContext* ctx) {
+             : apply_palette(obj.raw_color, palette_reg);
+         ppu->color_framebuffer[framebuffer_index] =
+             resolve_obj_color(ppu, ctx, obj.palette, obj.raw_color, palette_reg);
++        ppu_layer_buffer[framebuffer_index] =
++            obj.palette ? PPU_LAYER_OBJ1 : PPU_LAYER_OBJ0;
+     } else {
+         ppu->framebuffer[framebuffer_index] = cgb_mode
+             ? bg.raw_color
+             : apply_palette(bg.raw_color, ppu->bgp);
+         ppu->color_framebuffer[framebuffer_index] =
+             resolve_bg_color(ppu, ctx, bg.palette, bg.raw_color, ppu->bgp);
++        ppu_layer_buffer[framebuffer_index] =
++            ppu->window_active_line ? PPU_LAYER_WIN : PPU_LAYER_BG;
+     }
+ }
+ 
+@@ -1073,6 +1115,8 @@ static void ppu_render_background_span(GBPPU* ppu,
+             : apply_palette(raw_color, ppu->bgp);
+         ppu->color_framebuffer[framebuffer_index] =
+             resolve_bg_color(ppu, ctx, palette, raw_color, ppu->bgp);
++        ppu_layer_buffer[framebuffer_index] =
++            in_window ? PPU_LAYER_WIN : PPU_LAYER_BG;
+     }
+ }
+ 
+@@ -1094,6 +1138,37 @@ static void ppu_select_line_sprites(GBPPU* ppu, const GBContext* ctx) {
+         ppu->visible_sprite_x[slot] = ctx->oam[offset + 1u];
+         ppu->visible_sprite_y[slot] = y;
+     }
++
++    /* Build the render-only list. Priority between overlapping sprites is
++     * resolved per dot in ppu_fetch_object_dot() (DMG: lower X, then lower
++     * OAM index; CGB: OAM index), so OAM order is sufficient here. */
++    render_sprite_owner = ppu;
++    render_sprite_ly = (int)ppu->ly;
++    if (!gbrt_unlimited_sprites || ppu->visible_sprite_count < 10) {
++        render_sprite_count = ppu->visible_sprite_count;
++        memcpy(render_sprite_indices, ppu->visible_sprite_indices,
++               ppu->visible_sprite_count);
++        memcpy(render_sprite_x, ppu->visible_sprite_x,
++               ppu->visible_sprite_count);
++        memcpy(render_sprite_y, ppu->visible_sprite_y,
++               ppu->visible_sprite_count);
++        return;
++    }
++
++    render_sprite_count = 0;
++    for (uint8_t index = 0; index < 40; ++index) {
++        const size_t offset = (size_t)index * 4u;
++        const uint8_t y = ctx->oam[offset];
++        const int screen_y = (int)y - 16;
++        if ((int)ppu->ly < screen_y ||
++            (int)ppu->ly >= screen_y + ppu->line_sprite_height) {
++            continue;
++        }
++        const uint8_t slot = render_sprite_count++;
++        render_sprite_indices[slot] = index;
++        render_sprite_x[slot] = ctx->oam[offset + 1u];
++        render_sprite_y[slot] = y;
++    }
+ }
+ 
+ static void ppu_begin_dot_transfer(GBPPU* ppu, const GBContext* ctx) {
